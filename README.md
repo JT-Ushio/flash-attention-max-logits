@@ -62,6 +62,19 @@ from flash_attn_3 import flash_attn_interface
 flash_attn_interface.flash_attn_func()
 ```
 
+To return the per-query-head maximum attention logits for QK-Clip:
+```python
+out, max_logits = flash_attn_interface.flash_attn_func(
+    q, k, v, causal=True, return_max_logits=True
+)
+```
+`max_logits` is a non-differentiable FP32 tensor of shape `(num_heads_q,)`. It contains the maximum
+of the scaled logits over the batch and all valid query-key pairs. If data parallelism partitions a
+training batch, reduce it with `MAX` across the data-parallel group. `return_max_logits=True` is not
+supported together with `softcap`, because QK-Clip requires logits before softcapping.
+The requested `softmax_scale` must be non-negative, and value head dimensions above 256 are not
+currently supported by this statistic.
+
 To install using `uv`, in your `pyproject.toml`:
 
 ```toml

@@ -704,7 +704,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         std::optional<at::Tensor> scheduler_metadata_,  // (b + 1)
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
-        int64_t sm_margin
+        int64_t sm_margin,
+        std::optional<at::Tensor> max_logits_
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -891,6 +892,19 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
     }
 
+    at::Tensor max_logits;
+    if (max_logits_.has_value()) {
+        max_logits = max_logits_.value();
+        CHECK_DEVICE(max_logits); CHECK_CONTIGUOUS(max_logits);
+        TORCH_CHECK(max_logits.device() == q.device(), "max_logits must be on the same device as query");
+        TORCH_CHECK(max_logits.scalar_type() == at::kFloat, "max_logits must have dtype torch.float32");
+        CHECK_SHAPE(max_logits, num_heads);
+        TORCH_CHECK(softcap == 0.0, "return_max_logits does not support softcap; QK-Clip requires pre-softcap logits");
+        TORCH_CHECK(softmax_scale >= 0.0, "return_max_logits requires a non-negative softmax_scale");
+        TORCH_CHECK(head_size_v <= 256, "return_max_logits does not support value head dimensions greater than 256");
+        max_logits.fill_(-std::numeric_limits<float>::infinity());
+    }
+
     Flash_fwd_params params;
     set_params_fprop(params,
                      batch_size,
@@ -911,6 +925,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
                      attention_chunk,
                      softcap,
                      sm_margin);
+    params.max_logits_ptr = max_logits_.has_value() ? max_logits.data_ptr<float>() : nullptr;
     params.total_q = total_q;
     params.total_k = total_k;
     params.b_k = batch_size_k;
@@ -1705,7 +1720,8 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor? scheduler_metadata = None,"
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
-        "int sm_margin = 0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+        "int sm_margin = 0,"
+        "Tensor(max_logits!)? max_logits = None) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"

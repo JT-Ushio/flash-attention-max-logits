@@ -129,6 +129,7 @@ struct CollectiveEpilogueFwd {
         StrideLSE const stride_LSE;
         float* ptr_LSE_partial;
         StrideLSE const stride_LSE_partial;
+        float* ptr_max_logits;
         int32_t const nheads_kv;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
@@ -151,6 +152,7 @@ struct CollectiveEpilogueFwd {
         float* ptr_LSE_partial;
         StrideLSE const stride_LSE_partial;
         StrideLSEPacked const stride_LSE_partial_packed;
+        float* ptr_max_logits;
         cutlass::FastDivmod qhead_per_khead_divmod;
         TMA_O tma_store_O;
         int const* cu_seqlens = nullptr;
@@ -198,6 +200,7 @@ struct CollectiveEpilogueFwd {
                 args.ptr_O_partial, args.stride_O_partial, stride_O_partial_packed,
                 args.ptr_LSE, args.stride_LSE, shape_LSE_packed, stride_LSE_packed,
                 args.ptr_LSE_partial, args.stride_LSE_partial, stride_LSE_partial_packed,
+                args.ptr_max_logits,
                 cutlass::FastDivmod(qhead_per_khead),
                 tma_store_O, args.cu_seqlens, args.seqused};
     }
@@ -210,11 +213,13 @@ struct CollectiveEpilogueFwd {
         }
     }
 
-    template <typename SharedStorage, typename FrgTensorO, typename FrgTensorLSE, typename TiledMma>
+    template <typename SharedStorage, typename FrgTensorO, typename FrgTensorLSE, typename FrgTensorMax, typename TiledMma>
     CUTLASS_DEVICE void
     store(Params const& params,
           FrgTensorO& tOrO,
           FrgTensorLSE const& lse,
+          FrgTensorMax const& row_max,
+          float const max_logits_scale,
           SharedStorage& shared_storage,
           TiledMma tiled_mma,
           int thread_idx,
@@ -304,6 +309,35 @@ struct CollectiveEpilogueFwd {
                 }
             } else {
                 PackGQA_t::store_LSE(mLSE, lse, tiled_mma, params.qhead_per_khead_divmod, thread_idx, seqlen_o, m_block);
+            }
+
+            if (params.ptr_max_logits != nullptr) {
+                if constexpr (!PackGQA) {
+                    float thread_max = -INFINITY;
+                    #pragma unroll
+                    for (int mi = 0; mi < size(row_max); ++mi) {
+                        int const row = m_block * kBlockM + get<0>(taccOcO_row(mi));
+                        if (row < seqlen_o) { thread_max = max(thread_max, row_max(mi)); }
+                    }
+                    MaxOp<float> max_op;
+                    float const warp_max = Allreduce<cutlass::NumThreadsPerWarp>::run(thread_max, max_op);
+                    if (thread_idx % cutlass::NumThreadsPerWarp == 0 && warp_max != -INFINITY) {
+                        atomic_max_float(params.ptr_max_logits + bidh, warp_max * max_logits_scale);
+                    }
+                } else {
+                    int const qhead_per_khead = params.qhead_per_khead_divmod.divisor;
+                    #pragma unroll
+                    for (int mi = 0; mi < size(row_max); ++mi) {
+                        int const row = m_block * kBlockM + get<0>(taccOcO_row(mi));
+                        if (get<1>(taccOcO_row(_0{})) == 0 && row < seqlen_o * qhead_per_khead) {
+                            int qhead_in_group;
+                            params.qhead_per_khead_divmod.divmod(qhead_in_group, row);
+                            int const qhead = bidh * qhead_per_khead + qhead_in_group;
+                            float const value = row_max(mi) == -INFINITY ? -INFINITY : row_max(mi) * max_logits_scale;
+                            atomic_max_float(params.ptr_max_logits + qhead, value);
+                        }
+                    }
+                }
             }
         }
 
@@ -398,6 +432,18 @@ struct CollectiveEpilogueFwd {
                     PackGQApartial_t::store_O_direct(mOpartial, tOrO, tiled_mma, params.qhead_per_khead_divmod, thread_idx, seqlen_o, m_block);
                 }
             }
+        }
+    }
+
+    CUTLASS_DEVICE
+    static void
+    atomic_max_float(float* address, float const value) {
+        int* address_as_int = reinterpret_cast<int*>(address);
+        int old = *address_as_int;
+        while (__int_as_float(old) < value) {
+            int const assumed = old;
+            old = atomicCAS(address_as_int, assumed, __float_as_int(value));
+            if (old == assumed) { break; }
         }
     }
 

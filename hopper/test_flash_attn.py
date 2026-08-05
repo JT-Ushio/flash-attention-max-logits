@@ -111,6 +111,169 @@ if ENABLE_OPCHECK:
     flash_attn_varlen_func = run_opcheck(flash_attn_varlen_func)
 
 
+def max_logits_ref(q, k, softmax_scale, causal):
+    k = torch.repeat_interleave(k, q.shape[-2] // k.shape[-2], dim=-2)
+    scores = torch.einsum("bqhd,bkhd->bhqk", q.float(), k.float()) * softmax_scale
+    if causal:
+        seqlen_q, seqlen_k = q.shape[1], k.shape[1]
+        row = torch.arange(seqlen_q, device=q.device)[:, None]
+        col = torch.arange(seqlen_k, device=q.device)[None, :]
+        scores.masked_fill_(col > row + seqlen_k - seqlen_q, -torch.inf)
+    return scores.amax(dim=(0, 2, 3))
+
+
+@pytest.mark.skipif(DISABLE_HDIM64, reason="This build does not include head dimension 64")
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("num_splits", [1] + ([] if DISABLE_SPLIT else [3]))
+@pytest.mark.parametrize("pack_gqa", [False] + ([] if DISABLE_PACKGQA else [True]))
+def test_flash_attn_max_logits(causal, num_splits, pack_gqa):
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k = 2, 73, 1025
+    nheads, nheads_kv, d = 6, 2, 64
+    softmax_scale = 0.37
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    out, max_logits = flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        return_max_logits=True,
+    )
+    max_logits_expected = max_logits_ref(q, k, softmax_scale, causal)
+
+    assert out.shape == q.shape
+    assert max_logits.shape == (nheads,)
+    assert max_logits.dtype == torch.float32
+    torch.testing.assert_close(max_logits, max_logits_expected, atol=3e-2, rtol=3e-3)
+
+
+@pytest.mark.skipif(DISABLE_HDIM64 or DISABLE_SPLIT, reason="Requires hdim64 and Split-KV")
+def test_flash_attn_varlen_max_logits():
+    torch.manual_seed(1)
+    seqlens_q = torch.tensor([5, 9, 3], device="cuda", dtype=torch.int32)
+    seqlens_k = torch.tensor([7, 4, 11], device="cuda", dtype=torch.int32)
+    cu_seqlens_q = F.pad(torch.cumsum(seqlens_q, dim=0, dtype=torch.int32), (1, 0))
+    cu_seqlens_k = F.pad(torch.cumsum(seqlens_k, dim=0, dtype=torch.int32), (1, 0))
+    nheads, nheads_kv, d = 6, 2, 64
+    softmax_scale = 0.41
+    q = torch.randn(int(seqlens_q.sum()), nheads, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(int(seqlens_k.sum()), nheads_kv, d, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    _, max_logits = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        int(seqlens_q.max()),
+        int(seqlens_k.max()),
+        softmax_scale=softmax_scale,
+        causal=True,
+        num_splits=3,
+        pack_gqa=False if DISABLE_PACKGQA else True,
+        return_max_logits=True,
+    )
+
+    max_logits_expected = torch.full((nheads,), -torch.inf, device="cuda")
+    q_offset = k_offset = 0
+    for sq, sk in zip(seqlens_q.tolist(), seqlens_k.tolist()):
+        q_cur = q[q_offset : q_offset + sq].unsqueeze(0)
+        k_cur = k[k_offset : k_offset + sk].unsqueeze(0)
+        max_logits_expected = torch.maximum(
+            max_logits_expected,
+            max_logits_ref(q_cur, k_cur, softmax_scale, causal=True),
+        )
+        q_offset += sq
+        k_offset += sk
+
+    torch.testing.assert_close(max_logits, max_logits_expected, atol=3e-2, rtol=3e-3)
+
+
+@pytest.mark.skipif(
+    DISABLE_HDIM64 or torch.cuda.get_device_capability("cuda")[0] != 9,
+    reason="Qv requires hdim64 on Hopper",
+)
+def test_flash_attn_max_logits_qv():
+    torch.manual_seed(2)
+    batch_size, seqlen_q, seqlen_k = 2, 17, 23
+    nheads, nheads_kv, d, dv = 4, 2, 64, 256
+    softmax_scale = 0.09
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(batch_size, seqlen_k, nheads_kv, dv, device="cuda", dtype=torch.bfloat16)
+    qv = torch.randn(batch_size, seqlen_q, nheads, dv, device="cuda", dtype=torch.bfloat16)
+
+    _, max_logits = flash_attn_func(
+        q,
+        k,
+        v,
+        qv=qv,
+        softmax_scale=softmax_scale,
+        causal=True,
+        return_max_logits=True,
+    )
+
+    k_per_head = torch.repeat_interleave(k, nheads // nheads_kv, dim=-2)
+    v_per_head = torch.repeat_interleave(v, nheads // nheads_kv, dim=-2)
+    scores = torch.einsum("bqhd,bkhd->bhqk", q.float(), k_per_head.float())
+    scores += torch.einsum("bqhd,bkhd->bhqk", qv.float(), v_per_head.float())
+    scores *= softmax_scale
+    row = torch.arange(seqlen_q, device=q.device)[:, None]
+    col = torch.arange(seqlen_k, device=q.device)[None, :]
+    scores.masked_fill_(col > row + seqlen_k - seqlen_q, -torch.inf)
+    max_logits_expected = scores.amax(dim=(0, 2, 3))
+
+    torch.testing.assert_close(max_logits, max_logits_expected, atol=6e-2, rtol=4e-3)
+
+
+@pytest.mark.skipif(DISABLE_HDIM64, reason="This build does not include head dimension 64")
+def test_flash_attn_max_logits_return_contract_and_empty_kv():
+    q = torch.randn(2, 8, 4, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(2, 8, 4, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn_like(k, requires_grad=True)
+
+    out, lse, max_logits = flash_attn_func(
+        q, k, v, return_attn_probs=True, return_max_logits=True
+    )
+    assert lse.shape == (2, 4, 8)
+    assert max_logits.shape == (4,)
+    assert not max_logits.requires_grad
+    if not DISABLE_BACKWARD:
+        out.sum().backward()
+        assert q.grad is not None and k.grad is not None and v.grad is not None
+
+    k_empty = k.detach()[:, :0]
+    v_empty = v.detach()[:, :0]
+    out_empty, max_logits_empty = flash_attn_func(
+        q.detach(), k_empty, v_empty, return_max_logits=True
+    )
+    assert torch.count_nonzero(out_empty) == 0
+    assert torch.all(max_logits_empty == -torch.inf)
+
+    if not DISABLE_SOFTCAP:
+        with pytest.raises(ValueError, match="does not support softcap"):
+            flash_attn_func(q.detach(), k.detach(), v.detach(), softcap=10.0, return_max_logits=True)
+
+    with pytest.raises(ValueError, match="non-negative softmax_scale"):
+        flash_attn_func(q.detach(), k.detach(), v.detach(), softmax_scale=-0.1, return_max_logits=True)
+    with pytest.raises(ValueError, match="non-negative softmax_scale"):
+        flash_attn_func(q.detach(), k.detach(), v.detach(), softmax_scale=float("nan"), return_max_logits=True)
+
+    with pytest.raises(ValueError, match="does not support softcap"):
+        flash_attn_func(q.detach(), k.detach(), v.detach(), softcap=-1.0, return_max_logits=True)
+
+    v_wide = torch.randn(2, 8, 4, 512, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="value head dimensions greater than 256"):
+        flash_attn_func(q.detach(), k.detach(), v_wide, return_max_logits=True)
+
+
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float16] if not DISABLE_FP16 else []) + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])

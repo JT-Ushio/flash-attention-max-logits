@@ -56,6 +56,29 @@ def round_up_headdim(head_size: int) -> int:
     return 256
 
 
+def _format_forward_output(out, softmax_lse, max_logits, return_softmax, return_max_logits):
+    if return_softmax and return_max_logits:
+        return out, softmax_lse, max_logits
+    if return_softmax:
+        return out, softmax_lse
+    if return_max_logits:
+        return out, max_logits
+    return out
+
+
+def _validate_max_logits_args(return_max_logits, softmax_scale, softcap, head_size_v):
+    if not return_max_logits:
+        return
+    if USE_TRITON_ROCM:
+        raise NotImplementedError("return_max_logits is only implemented by the CUDA FA3 backend")
+    if softcap != 0.0:
+        raise ValueError("return_max_logits does not support softcap; QK-Clip requires pre-softcap logits")
+    if softmax_scale is not None and not (softmax_scale >= 0.0):
+        raise ValueError("return_max_logits requires a non-negative softmax_scale")
+    if head_size_v > 256:
+        raise ValueError("return_max_logits does not support value head dimensions greater than 256")
+
+
 @torch.library.custom_op("flash_attn_3::_flash_attn_forward", mutates_args=(), device_types="cuda")
 def _flash_attn_forward(
     q: torch.Tensor,
@@ -92,7 +115,8 @@ def _flash_attn_forward(
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
     sm_margin: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_max_logits: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
     cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new = [
@@ -104,7 +128,9 @@ def _flash_attn_forward(
     ]
     rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
     seqlens_rotary = maybe_contiguous(seqlens_rotary)
-    out, softmax_lse, out_accum, softmax_lse_accum = flash_attn_3_gpu.fwd(
+    _validate_max_logits_args(return_max_logits, softmax_scale, softcap, v.shape[-1])
+    max_logits = torch.empty((q.shape[-2],), dtype=torch.float32, device=q.device) if return_max_logits else None
+    fwd_args = (
         q,
         k,
         v,
@@ -140,6 +166,9 @@ def _flash_attn_forward(
         pack_gqa,
         sm_margin,
     )
+    if not USE_TRITON_ROCM:
+        fwd_args += (max_logits,)
+    out, softmax_lse, out_accum, softmax_lse_accum = flash_attn_3_gpu.fwd(*fwd_args)
 
     if out_accum is None:
         out_accum = torch.tensor([], device=out.device)
@@ -147,7 +176,10 @@ def _flash_attn_forward(
     if softmax_lse_accum is None:
         softmax_lse_accum = torch.tensor([], device=out.device)
 
-    return out, softmax_lse, out_accum, softmax_lse_accum
+    if max_logits is None:
+        max_logits = torch.tensor([], device=out.device)
+
+    return out, softmax_lse, out_accum, softmax_lse_accum, max_logits
 
 
 @torch.library.register_fake("flash_attn_3::_flash_attn_forward")
@@ -186,7 +218,8 @@ def _flash_attn_forward_fake(
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
     sm_margin: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_max_logits: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Symbolic fake implementation of flash attention forward.
     Returns tensors with the correct shapes and dtypes without actual computation.
@@ -210,6 +243,7 @@ def _flash_attn_forward_fake(
         total_q = batch_size * q.shape[1]
     # Get value head dimension
     head_size_v = v.shape[-1]
+    _validate_max_logits_args(return_max_logits, softmax_scale, softcap, head_size_v)
 
     # Determine output dtype (FP8 inputs produce BF16 outputs)
     q_type = q.dtype
@@ -252,7 +286,13 @@ def _flash_attn_forward_fake(
         out_accum = torch.tensor([], device=out.device)
         softmax_lse_accum = torch.tensor([], device=out.device)
 
-    return out, softmax_lse, out_accum, softmax_lse_accum
+    max_logits = (
+        torch.empty((num_heads,), dtype=torch.float32, device=q.device)
+        if return_max_logits
+        else torch.tensor([], device=out.device)
+    )
+
+    return out, softmax_lse, out_accum, softmax_lse_accum, max_logits
 
 
 @torch.library.custom_op("flash_attn_3::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")
@@ -409,14 +449,15 @@ def _flash_attn_backward_fake(
 
 def setup_context(ctx, inputs, output):
     q, k, v = inputs[:3]
-    out, softmax_lse, _, _ = output
+    out, softmax_lse, _, _, max_logits = output
     ctx.save_for_backward(q, k, v, out, softmax_lse)
-    ctx.softmax_scale = inputs[-11]
-    ctx.causal = inputs[-10]
-    ctx.window_size = [inputs[-9], inputs[-8]]
-    ctx.attention_chunk = inputs[-7]
-    ctx.softcap = inputs[-6]
-    ctx.sm_margin = inputs[-1]
+    ctx.mark_non_differentiable(max_logits)
+    ctx.softmax_scale = inputs[23]
+    ctx.causal = inputs[24]
+    ctx.window_size = [inputs[25], inputs[26]]
+    ctx.attention_chunk = inputs[27]
+    ctx.softcap = inputs[28]
+    ctx.sm_margin = inputs[33]
 
 
 def _backward(ctx, dout, *grads):
@@ -443,7 +484,7 @@ def _backward(ctx, dout, *grads):
         False, # deterministic
         ctx.sm_margin,
     )
-    return dq, dk, dv, *((None,) * 21)
+    return dq, dk, dv, *((None,) * 32)
 
 
 _flash_attn_forward.register_autograd(_backward, setup_context=setup_context)
@@ -465,6 +506,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         num_heads_q=None,
         sm_margin=0,
         return_softmax=False,
+        return_max_logits=False,
     ):
         if softmax_scale is None:
             softmax_scale = qkv.shape[-1] ** (-0.5)
@@ -477,7 +519,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             num_heads_k = (qkv.shape[2] - num_heads_q) // 2
             assert num_heads_k * 2 + num_heads_q == qkv.shape[2]
             q, k, v = qkv.split([num_heads_q, num_heads_k, num_heads_k], dim=-2)
-        out, softmax_lse, *rest = _flash_attn_forward(
+        out, softmax_lse, _, _, max_logits = _flash_attn_forward(
             q,
             k,
             v,
@@ -497,6 +539,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             attention_chunk=attention_chunk,
             softcap=softcap,
             sm_margin=sm_margin,
+            return_max_logits=return_max_logits,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
         ctx.save_for_backward(q, k, v, out, softmax_lse)
@@ -508,7 +551,9 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         ctx.deterministic = deterministic
         ctx.ndim = qkv.dim()
         ctx.sm_margin = sm_margin
-        return (out, softmax_lse) if return_softmax else out
+        if return_max_logits:
+            ctx.mark_non_differentiable(max_logits)
+        return _format_forward_output(out, softmax_lse, max_logits, return_softmax, return_max_logits)
 
     @staticmethod
     def backward(ctx, dout, *args):
@@ -546,7 +591,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             ctx.sm_margin,
         )
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
-        return dqkv, None, None, None, None, None, None, None, None, None, None, None, None
+        return dqkv, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnFunc(torch.autograd.Function):
@@ -569,11 +614,12 @@ class FlashAttnFunc(torch.autograd.Function):
         deterministic=False,
         sm_margin=0,
         return_softmax=False,
+        return_max_logits=False,
     ):
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
         # out, q, k, v, out_padded, softmax_lse = _flash_attn_forward(
-        out, softmax_lse, *rest = _flash_attn_forward(
+        out, softmax_lse, _, _, max_logits = _flash_attn_forward(
             q,
             k,
             v,
@@ -595,6 +641,7 @@ class FlashAttnFunc(torch.autograd.Function):
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             sm_margin=sm_margin,
+            return_max_logits=return_max_logits,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
         ctx.save_for_backward(q, k, v, out, softmax_lse)
@@ -605,7 +652,9 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
-        return (out, softmax_lse) if return_softmax else out
+        if return_max_logits:
+            ctx.mark_non_differentiable(max_logits)
+        return _format_forward_output(out, softmax_lse, max_logits, return_softmax, return_max_logits)
 
     @staticmethod
     def backward(ctx, dout, *args):
@@ -636,7 +685,7 @@ class FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
         dv = dv[..., : v.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -665,11 +714,12 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         deterministic=False,
         sm_margin=0,
         return_softmax=False,
+        return_max_logits=False,
     ):
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
         # out, q, k, v, out_padded, softmax_lse = _flash_attn_varlen_forward(
-        out, softmax_lse, *rest = _flash_attn_forward(
+        out, softmax_lse, _, _, max_logits = _flash_attn_forward(
             q,
             k,
             v,
@@ -695,6 +745,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             sm_margin=sm_margin,
+            return_max_logits=return_max_logits,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
@@ -707,7 +758,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
-        return (out, softmax_lse) if return_softmax else out
+        if return_max_logits:
+            ctx.mark_non_differentiable(max_logits)
+        return _format_forward_output(out, softmax_lse, max_logits, return_softmax, return_max_logits)
 
     @staticmethod
     def backward(ctx, dout, *args):
@@ -741,7 +794,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
         dv = dv[..., : v.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
@@ -756,6 +809,7 @@ def flash_attn_qkvpacked_func(
     num_heads_q=None,
     sm_margin=0,
     return_attn_probs=False,
+    return_max_logits=False,
 ):
     """dropout_p should be set to 0.0 during evaluation
     If Q, K, V are already stacked into 1 tensor, this function will be faster than
@@ -782,11 +836,15 @@ def flash_attn_qkvpacked_func(
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
+        return_max_logits: bool. Whether to return the per-head maximum scaled attention logit
+            across all valid query-key pairs in the batch. This requires a non-negative scale and
+            softcap=0.
     Return:
         out: (batch_size, seqlen, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
+        max_logits [optional, if return_max_logits=True]: (nheads,), dtype float32.
         S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
@@ -803,6 +861,7 @@ def flash_attn_qkvpacked_func(
         num_heads_q,
         sm_margin,
         return_attn_probs,
+        return_max_logits,
     )
 
 
@@ -822,6 +881,7 @@ def flash_attn_func(
     deterministic=False,
     sm_margin=0,
     return_attn_probs=False,
+    return_max_logits=False,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -862,11 +922,18 @@ def flash_attn_func(
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
+        return_max_logits: bool. Whether to return the per-head maximum scaled attention logit
+            across the batch and all valid query-key pairs. If qv is supplied, this is the maximum
+            of (QK^T + QvV^T) * scaling. The returned tensor has shape (nheads,), dtype float32,
+            and is non-differentiable. This requires a non-negative scale, softcap=0, and value
+            head dimension at most 256.
     Return:
         out: (batch_size, seqlen, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
+        max_logits [optional, if return_max_logits=True]: (nheads,). Per-head maximum scaled
+            attention logit across the batch.
     """
     return FlashAttnFunc.apply(
         q,
@@ -884,6 +951,7 @@ def flash_attn_func(
         deterministic,
         sm_margin,
         return_attn_probs,
+        return_max_logits,
     )
 
 
@@ -909,7 +977,15 @@ def flash_attn_varlen_func(
     deterministic=False,
     sm_margin=0,
     return_attn_probs=False,
+    return_max_logits=False,
 ):
+    """Variable-length FlashAttention.
+
+    If return_max_logits is True, also returns a non-differentiable FP32 tensor of shape
+    (nheads,) containing the maximum scaled attention logit across all sequences and valid
+    query-key pairs. With qv, the statistic includes both QK^T and QvV^T. This requires a
+    non-negative softmax_scale, softcap=0, and value head dimension at most 256.
+    """
     return FlashAttnVarlenFunc.apply(
         q,
         k,
@@ -932,6 +1008,7 @@ def flash_attn_varlen_func(
         deterministic,
         sm_margin,
         return_attn_probs,
+        return_max_logits,
     )
 
 
@@ -970,6 +1047,7 @@ def flash_attn_with_kvcache(
     pack_gqa=None,   # Can be tuned for speed
     sm_margin=0,     # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
+    return_max_logits=False,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -1049,12 +1127,18 @@ def flash_attn_with_kvcache(
            to automatically determine the number of splits.
            Don't change this unless you know what you are doing.
         return_softmax_lse: bool. Whether to return the logsumexp of the attention scores.
+        return_max_logits: bool. Whether to return the per-head maximum scaled attention logit
+            across all valid query-key pairs in the batch. With qv, the statistic includes both
+            QK^T and QvV^T. This requires a non-negative scale, softcap=0, and value head dimension
+            at most 256.
 
     Return:
         out: (batch_size, seqlen, nheads, headdim).
         softmax_lse [optional, if return_softmax_lse=True]: (batch_size, nheads, seqlen). The
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
+        max_logits [optional, if return_max_logits=True]: (nheads,), dtype float32. When both
+            return flags are true, returns (out, softmax_lse, max_logits).
     """
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
@@ -1065,7 +1149,7 @@ def flash_attn_with_kvcache(
             (q.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
         )
         cache_seqlens = maybe_contiguous(cache_seqlens)
-    out, softmax_lse, *rest = _flash_attn_forward(
+    out, softmax_lse, out_accum, softmax_lse_accum, max_logits = _flash_attn_forward(
         q,
         k_cache,
         v_cache,
@@ -1098,9 +1182,12 @@ def flash_attn_with_kvcache(
         num_splits=num_splits,
         pack_gqa=pack_gqa,
         sm_margin=sm_margin,
+        return_max_logits=return_max_logits,
     )
-    # return (out, softmax_lse) if return_softmax_lse else out
-    return (out, softmax_lse, *rest) if return_softmax_lse else out
+    if return_max_logits:
+        return _format_forward_output(out, softmax_lse, max_logits, return_softmax_lse, True)
+    # Preserve the existing low-level scratch outputs for return_softmax_lse callers.
+    return (out, softmax_lse, out_accum, softmax_lse_accum) if return_softmax_lse else out
 
 
 def get_scheduler_metadata(
