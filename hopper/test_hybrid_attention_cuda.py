@@ -21,18 +21,19 @@ def _interface():
     return fa
 
 
+@pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
     "window,sinks", [(1, 0), (37, 5), (128, 0), (400, 7), (400, 300)]
 )
-def test_cuda_unified_softmax_gradients(dtype, window, sinks):
+def test_cuda_unified_softmax_gradients(dtype, window, sinks, head_dim):
     _interface()
     torch.manual_seed(5)
     shapes = [
-        (2, 259, 4, 64),
-        (2, 259, 2, 64),
-        (2, 259, 2, 64),
-        (2, 259, 4, 64),
+        (2, 259, 4, head_dim),
+        (2, 259, 2, head_dim),
+        (2, 259, 2, head_dim),
+        (2, 259, 4, head_dim),
         (2, 259, 4),
     ]
     xs = [
@@ -163,9 +164,10 @@ def test_cuda_lse_backward_all_interfaces(mode, api, left, softcap):
         torch.testing.assert_close(a.float(), e.float(), atol=0.008, rtol=0.01)
 
 
+@pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("kind", ["gdn", "kda", "gdn2"])
 @pytest.mark.parametrize("kv_heads", [1, 2])
-def test_cuda_fla_layer_output_and_parameter_gradients(kind, kv_heads):
+def test_cuda_fla_layer_output_and_parameter_gradients(kind, kv_heads, head_dim):
     _interface()
     pytest.importorskip("fla")
     torch.manual_seed(50)
@@ -173,7 +175,7 @@ def test_cuda_fla_layer_output_and_parameter_gradients(kind, kv_heads):
         d_model=64,
         num_heads=2,
         num_kv_heads=kv_heads,
-        head_dim=64,
+        head_dim=head_dim,
         window_size=19,
         num_sink_tokens=3,
         rnn_type=kind,
