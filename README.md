@@ -28,6 +28,10 @@ Please cite and credit FlashAttention if you use it.
 
 
 ## FlashAttention-3 beta release
+This branch also provides [window attention with delayed GDN/KDA/GDN2 memory](hopper/HYBRID_ATTENTION.md),
+shared Q/K/V projections, sink tokens, and unified softmax with differentiable LSE.
+See that guide for per-layer windows, installation, and validation limits.
+
 FlashAttention-3 is optimized for Hopper GPUs (e.g. H100). 
 
 Blogpost: https://tridao.me/blog/2024/flash3/

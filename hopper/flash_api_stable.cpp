@@ -1372,7 +1372,8 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> mha_bwd(
     int64_t window_size_right,
     double softcap,
     bool deterministic,
-    int64_t sm_margin
+    int64_t sm_margin,
+    std::optional<Tensor> dsoftmax_lse_
 ) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
@@ -1440,6 +1441,18 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> mha_bwd(
     double softmax_scale = 1.0 / sqrt(double(head_size));
     if (softmax_scale_.has_value()) {
         softmax_scale = softmax_scale_.value();
+    }
+
+    if (dsoftmax_lse_.has_value()) {
+        auto const& dlse = dsoftmax_lse_.value();
+        CHECK_DEVICE(dlse); CHECK_CONTIGUOUS(dlse);
+        STD_TORCH_CHECK(dlse.scalar_type() == torch::headeronly::ScalarType::Float, "dsoftmax_lse must have dtype float32");
+        STD_TORCH_CHECK(dlse.get_device() == q.get_device(), "dsoftmax_lse must be on the query device");
+        if (!is_varlen_q) {
+            CHECK_SHAPE(dlse, batch_size, num_heads, seqlen_q);
+        } else {
+            CHECK_SHAPE(dlse, num_heads, total_q);
+        }
     }
 
     // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM
@@ -1617,6 +1630,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> mha_bwd(
     params.total_q = total_q;
     params.total_k = total_k;
     params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
+    params.dsoftmax_lse_ptr = dsoftmax_lse_.has_value() ? static_cast<float const*>(dsoftmax_lse_.value().data_ptr()) : nullptr;
     params.dv = head_size_v;
     params.dv_rounded = head_size_v_rounded;
 
@@ -1844,8 +1858,9 @@ void boxed_mha_bwd(
     auto softcap = to<double>(stack[19]);
     auto deterministic = to<bool>(stack[20]);
     auto sm_margin = to<int64_t>(stack[21]);
+    auto dsoftmax_lse = to<std::optional<Tensor>>(stack[22]);
 
-    auto [softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum] = mha_bwd(dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal, window_size_left, window_size_right, softcap, deterministic, sm_margin);
+    auto [softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum] = mha_bwd(dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal, window_size_left, window_size_right, softcap, deterministic, sm_margin, dsoftmax_lse);
 
     stack[0] = from(softmax_d);
     stack[1] = from(softmax_lse_log2);
@@ -1964,7 +1979,8 @@ STABLE_TORCH_LIBRARY(flash_attn_3, m) {
         "int window_size_right = -1,"
         "float softcap = 0.0,"
         "bool deterministic = False,"
-        "int sm_margin = 0) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
+        "int sm_margin = 0,"
+        "Tensor? dsoftmax_lse = None) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def("fwd_combine("
         "Tensor out_partial,"
         "Tensor lse_partial,"

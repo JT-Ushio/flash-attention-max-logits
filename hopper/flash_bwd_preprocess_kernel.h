@@ -77,6 +77,7 @@ public:
         ShapedPsum const shape_dPsum;
         StridedPsum const stride_dPsum;
         float const* ptr_LSE;
+        float const* ptr_dLSE;
         StridedPsum const stride_LSE;
         float *ptr_LSE_log2;
         StridedPsum const stride_LSE_log2;
@@ -100,6 +101,7 @@ public:
         ShapedPsum const shape_dPsum;
         StridedPsum const stride_dPsum;
         float const* ptr_LSE;
+        float const* ptr_dLSE;
         StridedPsum const stride_LSE;
         float* ptr_LSE_log2;
         StridedPsum const stride_LSE_log2;
@@ -126,6 +128,7 @@ public:
             args.shape_dPsum,
             args.stride_dPsum,
             args.ptr_LSE,
+            args.ptr_dLSE,
             args.stride_LSE,
             args.ptr_LSE_log2,
             args.stride_LSE_log2,
@@ -217,7 +220,14 @@ public:
             #pragma unroll
             for (int mi = 0; mi < size(dP_sum); ++mi) {
                 int const row = get<0>(tOcO(_0{}, mi, _0{}));
-                gdPsum(row) = row < seqlen_o - m_block * kBlockM ? dP_sum(mi) : 0;
+                float delta = dP_sum(mi);
+                if (params.ptr_dLSE != nullptr && row < seqlen_o - m_block * kBlockM) {
+                    Tensor mdLSE = make_tensor(make_gmem_ptr(params.ptr_dLSE), shape_LSE, params.stride_LSE);
+                    // dS = P * (dO V^T - <dO, O> + dLSE).
+                    // Both the supplied LSE and dLSE use natural logarithms.
+                    delta -= mdLSE(seqlen_info.offset + m_block * kBlockM + row, bidh, !is_varlen ? bidb : 0);
+                }
+                gdPsum(row) = row < seqlen_o - m_block * kBlockM ? delta : 0;
             }
         }
 

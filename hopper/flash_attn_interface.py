@@ -319,10 +319,11 @@ def _flash_attn_backward(
     softcap: float = 0.0,
     deterministic: bool = False,
     sm_margin: int = 0,
+    dsoftmax_lse: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    softmax_d, *rest = flash_attn_3_gpu.bwd(
+    bwd_args = (
         dout,
         q,
         k,
@@ -346,6 +347,12 @@ def _flash_attn_backward(
         deterministic,
         sm_margin,
     )
+    if USE_TRITON_ROCM:
+        if dsoftmax_lse is not None:
+            raise NotImplementedError("LSE gradients require the CUDA FA3 backend")
+    else:
+        bwd_args += (dsoftmax_lse.contiguous() if dsoftmax_lse is not None else None,)
+    softmax_d, *rest = flash_attn_3_gpu.bwd(*bwd_args)
     return softmax_d
 
 
@@ -373,6 +380,7 @@ def _flash_attn_backward_fake(
     softcap: float = 0.0,
     deterministic: bool = False,
     sm_margin: int = 0,
+    dsoftmax_lse: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
 
     is_varlen_q = cu_seqlens_q is not None
@@ -450,8 +458,10 @@ def _flash_attn_backward_fake(
 def setup_context(ctx, inputs, output):
     q, k, v = inputs[:3]
     out, softmax_lse, _, _, max_logits = output
-    ctx.save_for_backward(q, k, v, out, softmax_lse)
+    ctx.save_for_backward(q, k, v, out, softmax_lse, inputs[7], inputs[8], inputs[10], inputs[11])
     ctx.mark_non_differentiable(max_logits)
+    ctx.set_materialize_grads(False)
+    ctx.max_seqlen_q, ctx.max_seqlen_k = inputs[12], inputs[13]
     ctx.softmax_scale = inputs[23]
     ctx.causal = inputs[24]
     ctx.window_size = [inputs[25], inputs[26]]
@@ -461,7 +471,9 @@ def setup_context(ctx, inputs, output):
 
 
 def _backward(ctx, dout, *grads):
-    q, k, v, out, softmax_lse = ctx.saved_tensors
+    q, k, v, out, softmax_lse, cu_q, cu_k, used_q, used_k = ctx.saved_tensors
+    assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
+    dout = torch.zeros_like(out) if dout is None else dout
     dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
     _flash_attn_backward(
         dout,
@@ -470,9 +482,9 @@ def _backward(ctx, dout, *grads):
         v,
         out,
         softmax_lse,
-        None, None, # cu_seqlens_q, cu_seqlens_k,
-        None, None, # sequed_q, sequed_k,
-        None, None, # max_seqlen_q, max_seqlen_k,
+        cu_q, cu_k,
+        used_q, used_k,
+        ctx.max_seqlen_q, ctx.max_seqlen_k,
         dq,
         dk,
         dv,
@@ -483,6 +495,7 @@ def _backward(ctx, dout, *grads):
         ctx.softcap,
         False, # deterministic
         ctx.sm_margin,
+        dsoftmax_lse=grads[0],
     )
     return dq, dk, dv, *((None,) * 32)
 
@@ -543,6 +556,8 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
         ctx.save_for_backward(q, k, v, out, softmax_lse)
+        ctx.set_materialize_grads(False)
+        ctx.return_softmax = return_softmax
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -558,6 +573,8 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse = ctx.saved_tensors
+        dout = torch.zeros_like(out) if dout is None else dout
+        dlse = args[0] if ctx.return_softmax else None
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
         if ctx.ndim == 5:
             qkv_shape = q.shape[:-2] + (3, *q.shape[-2:])
@@ -589,6 +606,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             ctx.softcap,
             ctx.deterministic,
             ctx.sm_margin,
+            dsoftmax_lse=dlse,
         )
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
         return dqkv, None, None, None, None, None, None, None, None, None, None, None, None, None
@@ -645,6 +663,8 @@ class FlashAttnFunc(torch.autograd.Function):
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
         ctx.save_for_backward(q, k, v, out, softmax_lse)
+        ctx.set_materialize_grads(False)
+        ctx.return_softmax = return_softmax
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -659,6 +679,8 @@ class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse = ctx.saved_tensors
+        dout = torch.zeros_like(out) if dout is None else dout
+        dlse = args[0] if ctx.return_softmax else None
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         _flash_attn_backward(
@@ -681,6 +703,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.softcap,
             ctx.deterministic,
             ctx.sm_margin,
+            dsoftmax_lse=dlse,
         )
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
@@ -751,6 +774,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
+        ctx.set_materialize_grads(False)
+        ctx.return_softmax = return_softmax
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -765,6 +790,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
+        dout = torch.zeros_like(out) if dout is None else dout
+        dlse = args[0] if ctx.return_softmax else None
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         _flash_attn_backward(
@@ -790,6 +817,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.softcap,
             ctx.deterministic,
             ctx.sm_margin,
+            dsoftmax_lse=dlse,
         )
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
@@ -843,7 +871,8 @@ def flash_attn_qkvpacked_func(
         out: (batch_size, seqlen, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
-            normalization factor).
+            normalization factor). On CUDA this output is differentiable, including
+            when it is the only output used by the loss.
         max_logits [optional, if return_max_logits=True]: (nheads,), dtype float32.
         S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
             The output of softmax (possibly with different scaling). It also encodes the dropout
@@ -931,7 +960,8 @@ def flash_attn_func(
         out: (batch_size, seqlen, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
-            normalization factor).
+            normalization factor). On CUDA this output is differentiable, including
+            when it is the only output used by the loss.
         max_logits [optional, if return_max_logits=True]: (nheads,). Per-head maximum scaled
             attention logit across the batch.
     """
@@ -980,6 +1010,9 @@ def flash_attn_varlen_func(
     return_max_logits=False,
 ):
     """Variable-length FlashAttention.
+
+    return_attn_probs=True returns (out, softmax_lse), with differentiable natural-log
+    LSE of shape (num_heads, total_q) on CUDA.
 
     If return_max_logits is True, also returns a non-differentiable FP32 tensor of shape
     (nheads,) containing the maximum scaled attention logit across all sequences and valid
@@ -1136,7 +1169,8 @@ def flash_attn_with_kvcache(
         out: (batch_size, seqlen, nheads, headdim).
         softmax_lse [optional, if return_softmax_lse=True]: (batch_size, nheads, seqlen). The
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
-            normalization factor).
+            normalization factor). On CUDA this output is differentiable, including
+            when it is the only output used by the loss.
         max_logits [optional, if return_max_logits=True]: (nheads,), dtype float32. When both
             return flags are true, returns (out, softmax_lse, max_logits).
     """

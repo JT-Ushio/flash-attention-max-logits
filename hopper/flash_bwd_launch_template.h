@@ -58,6 +58,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         {seqlen_q_rounded, params.h, batch_q},  // shape_dPsum
         {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  // stride_dPsum
         static_cast<float*>(params.softmax_lse_ptr),
+        params.dsoftmax_lse_ptr,
         {_1{}, seqlen_q, !is_varlen_q ? params.h * params.seqlen_q : 0},  // stride_LSE
         static_cast<float*>(params.softmax_lse_log2_ptr),
         {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  // stride_LSE_log2

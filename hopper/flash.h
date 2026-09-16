@@ -206,6 +206,8 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
     // The pointer to the softmax d sum.
     void *__restrict__ dsoftmax_sum;
+    // Optional gradient of the natural-log softmax partition, contiguous like LSE.
+    float const* __restrict__ dsoftmax_lse_ptr;
     void *__restrict__ softmax_lse_log2_ptr;
 
     int *__restrict__ dq_semaphore;
