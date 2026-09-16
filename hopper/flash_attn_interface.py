@@ -1169,8 +1169,7 @@ def flash_attn_with_kvcache(
         out: (batch_size, seqlen, nheads, headdim).
         softmax_lse [optional, if return_softmax_lse=True]: (batch_size, nheads, seqlen). The
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
-            normalization factor). On CUDA this output is differentiable, including
-            when it is the only output used by the loss.
+            normalization factor). This cache API does not support backward.
         max_logits [optional, if return_max_logits=True]: (nheads,), dtype float32. When both
             return flags are true, returns (out, softmax_lse, max_logits).
     """

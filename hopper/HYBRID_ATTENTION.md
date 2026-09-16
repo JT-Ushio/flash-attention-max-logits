@@ -207,8 +207,33 @@ python -m ruff check hopper/flash_attn_3/hybrid.py hopper/flash_attn_3/recurrent
 git diff --check
 ```
 
-Validation on the development Mac: **37 CPU tests passed; 46 CUDA tests skipped**.
-Native CUDA compilation, GPU numerical/gradient agreement, and throughput have
-not been verified there. In particular this is not a claim of a fused hybrid
-kernel or measured speedup. The server commands above are the outstanding
-acceptance checks before using the branch for training experiments.
+### GPU validation record (2026-09-16)
+
+Commit `1768aabf5e8e2241df6b04302ad5fd103d98e63a` was compiled from source
+and tested on one NVIDIA H200 (SM90), with PyTorch `2.10.0+cu128`, CUDA toolkit
+12.8, Triton 3.6.0, and the server's installed FLA 0.5.2. The loaded extension's
+path and `dsoftmax_lse` operator schema were checked before running the tests.
+The installed FLA package's originating Git revision was not recorded; the
+reference revision in the installation example above is not a claim about that
+server artifact.
+
+| Coverage | Passed |
+| --- | ---: |
+| CPU partition, recurrence, packed-document and decoding checks | 37 |
+| CUDA unified softmax output/input gradients, FP16/BF16, head dimensions 64/128 | 20 |
+| CUDA differentiable LSE, five APIs, output-only/LSE-only/mixed losses | 30 |
+| FLA GDN/KDA/GDN2 layer output/input/parameter gradients, BF16, MHA/GQA | 12 |
+| Existing max-logits regression (excluding `max_logits_qv`) | 10 |
+
+Both pytest runs finished with **zero failures, errors, or skips**: 99 hybrid
+tests in 332.64 seconds (including initial FLA compilation), then 10 max-logits
+tests in 3.79 seconds. The scheduler reported success with exit code 0.
+
+This was a targeted Hopper build with equal QK/V dimensions 64 and 128.
+SM80, FP8, paged/append KV, other head dimensions, and unequal QK/V dimensions
+were disabled for the build; consequently `max_logits_qv` was excluded from
+the regression command. The PyTorch 2.9+ stable-ABI binding was exercised; the
+older binding was not compiled in this run. These results establish numerical
+and gradient agreement for the tested configurations, not long-run training
+convergence, throughput, or a measured speedup. This is still a composition of
+FA3 calls and FLA kernels, rather than a single fused hybrid kernel.
