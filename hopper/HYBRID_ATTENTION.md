@@ -87,7 +87,23 @@ mass parameters. Q/K/V/O projections are shared between paths. Recurrent Q/K
 are L2-normalized (`rsqrt(sum(x*x)+1e-6)`), with read scale `1.0`; exact attention
 uses ordinary `1/sqrt(head_dim)` QK scaling. There is no separate recurrent QKV,
 short convolution, SiLU transform of shared KV, or independently projected output.
-Only decay/erase/write gates and the log-mass readout add parameters.
+By default, only decay/erase/write gates and the log-mass readout add parameters.
+
+Two independent ablation options are available (both disabled by default):
+
+- `sink_position_mode="window"`: exact attention uses the positions obtained by
+  reindexing the retained cache, including the current token. Sink keys keep
+  positions `0..N-1`, while the query position against sinks is `min(t, X-1)`.
+  Recent query/key relative distances are unchanged by a common position shift,
+  so that partition retains ordinary RoPE. Recurrence and memory mass are unchanged.
+- `memory_output_gate=True`: apply `SiLU(W_g x_t)` elementwise to the recurrent
+  readout before softmax fusion. This adds a bias-free `d_model -> Hq * Dv`
+  projection, without RMSNorm. Memory log-mass uses the **ungated** readout.
+  Gate projection is evaluated only for queries with nonempty memory.
+
+Both options support packed-document resets and the reference `step()` path.
+`test_window_ablations.py` checks explicit cache reindexing, gradients, decoding,
+gate isolation, and CUDA FA3/FLA output and parameter gradients.
 
 Let `k` be normalized, `g` log-decay, `b` erase, and `w` write. The common update is
 

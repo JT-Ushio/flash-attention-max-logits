@@ -85,12 +85,16 @@ def window_memory_attention(
     backend="fa3",
     deterministic=False,
     return_lse=False,
+    sink_q=None,
 ):
     """Self-attention with exactly one memory component per query head.
 
     q/k/v: [B,T,Hq/Hkv,D/Dv]; memory_value: [B,T,Hq,Dv];
     memory_log_mass: [B,T,Hq], already a log-partition (never QK-scaled).
-    q and k must already have the desired positional encoding. The caller must
+    q and k must already have the desired positional encoding. Optional
+    ``sink_q`` supplies a different query rotation against sinks;
+    this does not change recent-token scores or the causal sink prefix.
+    The caller must
     construct memory from ONLY tokens N <= j <= t-(window_size-N). Empty memory
     rows are forcibly masked here. Sink/recent overlap is counted exactly once.
     Returns [B,T,Hq,Dv], and optionally differentiable LSE [B,T,Hq].
@@ -127,6 +131,10 @@ def window_memory_attention(
         raise ValueError("softmax_scale must be finite and nonnegative")
 
     t = q.shape[1]
+    if sink_q is not None and (
+        sink_q.shape != q.shape or sink_q.dtype != q.dtype or sink_q.device != q.device
+    ):
+        raise ValueError("sink_q must match q shape, dtype and device")
     n = min(num_sink_tokens, t)
     recent = window_size - num_sink_tokens
     kwargs = dict(scale=scale, backend=backend, deterministic=deterministic)
@@ -155,7 +163,7 @@ def window_memory_attention(
         )
         if n:
             sink_o, sink_l = _attention_stats(
-                q[:, n:],
+                q[:, n:] if sink_q is None else sink_q[:, n:],
                 k[:, :n],
                 v[:, :n],
                 causal=False,

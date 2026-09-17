@@ -69,6 +69,9 @@ class WindowRNNAttention(nn.Module):
     GQA training repeats the recurrent KV/gates across query groups for FLA;
     step() keeps one persistent state per KV head. Packed forward currently calls
     each document separately (correctness first; no cross-document states/RoPE).
+    ``sink_position_mode='window'`` uses cache-relative RoPE distances to sinks.
+    ``memory_output_gate=True`` gates only the memory value with SiLU(W_g x);
+    log-mass continues to use the ungated readout. Defaults preserve the baseline.
     """
 
     def __init__(
@@ -86,6 +89,8 @@ class WindowRNNAttention(nn.Module):
         rope_theta=10000.0,
         backend="fa3",
         deterministic=False,
+        sink_position_mode="absolute",
+        memory_output_gate=False,
     ):
         super().__init__()
         _validate_window(window_size, num_sink_tokens)
@@ -114,6 +119,9 @@ class WindowRNNAttention(nn.Module):
         self.rnn_type, self.backend = rnn_type, backend
         self.rotary_dim, self.rope_theta = rotary_dim, rope_theta
         self.deterministic = deterministic
+        if sink_position_mode not in ("absolute", "window"):
+            raise ValueError("sink_position_mode must be absolute or window")
+        self.sink_position_mode = sink_position_mode
         self.q_proj = nn.Linear(d_model, num_heads * head_dim, bias=False)
         self.k_proj = nn.Linear(d_model, num_kv_heads * head_dim, bias=False)
         self.v_proj = nn.Linear(d_model, num_kv_heads * value_dim, bias=False)
@@ -133,6 +141,11 @@ class WindowRNNAttention(nn.Module):
         self.mass_q = nn.Parameter(torch.zeros(num_heads, head_dim))
         self.mass_value = nn.Parameter(torch.zeros(num_heads, value_dim))
         self.mass_bias = nn.Parameter(torch.zeros(num_heads))
+        self.output_gate_proj = (
+            nn.Linear(d_model, num_heads * value_dim, bias=False)
+            if memory_output_gate
+            else None
+        )
 
     @property
     def recent_size(self):
@@ -240,13 +253,31 @@ class WindowRNNAttention(nn.Module):
                 qn[:, start:], kn[:, source], v[:, source], self._gates(x[:, source])
             )
             count = torch.arange(1, t - start + 1, device=x.device)[None, :, None]
-            mv = torch.cat((mv[:, :start], read), dim=1)
+            memory_value = read
+            if self.output_gate_proj is not None:
+                gate = F.silu(self.output_gate_proj(x[:, start:])).unflatten(
+                    -1, (self.num_heads, self.value_dim)
+                )
+                memory_value = read * gate
+            mv = torch.cat((mv[:, :start], memory_value), dim=1)
             ml = torch.cat(
                 (ml[:, :start], self._log_mass(qn[:, start:], read, count)), dim=1
             )
         positions = torch.arange(t, device=x.device)
         qr = _rotary(q, positions, self.rope_theta, self.rotary_dim)
         kr = _rotary(k, positions, self.rope_theta, self.rotary_dim)
+        # Cache reindexing preserves recent relative distances. Only the sink
+        # partition needs a query with position capped at X-1 (includes self).
+        sink_q = (
+            _rotary(
+                q,
+                positions.clamp(max=self.window_size - 1),
+                self.rope_theta,
+                self.rotary_dim,
+            )
+            if self.sink_position_mode == "window"
+            else None
+        )
         out = window_memory_attention(
             qr,
             kr,
@@ -257,6 +288,7 @@ class WindowRNNAttention(nn.Module):
             num_sink_tokens=self.num_sink_tokens,
             backend=self.backend,
             deterministic=self.deterministic,
+            sink_q=sink_q,
         )
         return self.o_proj(out.flatten(-2))
 
@@ -328,6 +360,18 @@ class WindowRNNAttention(nn.Module):
             * self.head_dim**-0.5
         )
         count = cache.position + 1 - self.window_size
+        if self.sink_position_mode == "window" and sinks:
+            sink_q = _rotary(
+                q, pos.clamp(max=self.window_size - 1), self.rope_theta, self.rotary_dim
+            )
+            sink_k = exact_k[:, : len(sinks)].repeat_interleave(groups, 2)
+            sink_scores = (
+                torch.einsum(
+                    "bthd,bshd->bths", sink_q.to(state.dtype), sink_k.to(state.dtype)
+                )
+                * self.head_dim**-0.5
+            )
+            scores = torch.cat((sink_scores, scores[..., len(sinks) :]), dim=-1)
         if count > 0:
             grouped_q = (
                 qn[:, 0]
@@ -340,6 +384,11 @@ class WindowRNNAttention(nn.Module):
                 .to(q.dtype)
             )
             mass = self._log_mass(qn, read, x.new_tensor(count))
+            if self.output_gate_proj is not None:
+                gate = F.silu(self.output_gate_proj(x)).unflatten(
+                    -1, (self.num_heads, self.value_dim)
+                )
+                read = read * gate
             scores = torch.cat((scores, mass.unsqueeze(-1)), dim=-1)
             values = torch.cat(
                 (
